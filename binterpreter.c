@@ -32,7 +32,7 @@ static void print_bytes(
 	const size_t line_length
 ) {
 	rl_save_prompt();
-	printf("\r\x1B[K");//rl_clear_visible_line();
+	rl_clear_visible_line();
 	printf("\x1B[3%dm", text_colour);
 
 	for(size_t line_start = 0; line_start < data_size; line_start += line_length) {
@@ -159,25 +159,25 @@ int main(
 
 	if(num_arguments > 1) {
 		enum {
-			READLINE_POLLFD_IX,
-			STDIN_POLLFD_IX,
-			STDOUT_POLLFD_IX,
-			STDERR_POLLFD_IX,
-			NUM_POLLFDS
+			READLINE_POLLFD_INDEX,
+			STDIN_POLLFD_INDEX,
+			STDOUT_POLLFD_INDEX,
+			STDERR_POLLFD_INDEX,
+			POLLFD_COUNT
 		};
 
-		struct pollfd pollfds[NUM_POLLFDS];
+		struct pollfd pollfds[POLLFD_COUNT];
 
-		struct pollfd *const readline_pollfd = &pollfds[READLINE_POLLFD_IX];
+		struct pollfd *const readline_pollfd = &pollfds[READLINE_POLLFD_INDEX];
 		readline_pollfd->fd = STDIN_FILENO;
 		readline_pollfd->events = POLLIN;
 
-		struct pollfd *const stdin_pollfd = &pollfds[STDIN_POLLFD_IX];
+		struct pollfd *const stdin_pollfd = &pollfds[STDIN_POLLFD_INDEX];
 
-		struct pollfd *const stdout_pollfd = &pollfds[STDOUT_POLLFD_IX];
+		struct pollfd *const stdout_pollfd = &pollfds[STDOUT_POLLFD_INDEX];
 		stdout_pollfd->events = POLLIN;
 
-		struct pollfd *const stderr_pollfd = &pollfds[STDERR_POLLFD_IX];
+		struct pollfd *const stderr_pollfd = &pollfds[STDERR_POLLFD_INDEX];
 		stderr_pollfd->events = POLLIN;
 
 		const pid_t child_process = spawn_child_process(
@@ -187,12 +187,15 @@ int main(
 			&stderr_pollfd->fd
 		);
 		if(child_process > 0) {
+			char stderr_buffer[1024U];
+			size_t stderr_size = 0U;
+
 			rl_callback_handler_install(">>> ", handle_readline_input);
 
 			while(!eof_received && stdin_pollfd->fd >= 0 && stdout_pollfd->fd >= 0 && stderr_pollfd->fd >= 0) {
 				stdin_pollfd->events = input_size > 0 ? POLLOUT : 0;
 
-				const int poll_result = poll(pollfds, NUM_POLLFDS, -1);
+				const int poll_result = poll(pollfds, POLLFD_COUNT, -1);
 				if(poll_result < 0) {
 					if(errno != EINTR) {
 						fprintf(stderr, "Error: failed to poll\n");
@@ -226,9 +229,11 @@ int main(
 								input_size
 							);
 						} else if(bytes_written == 0 || errno != EINTR) {
+							close(stdin_pollfd->fd);
 							stdin_pollfd->fd = -1;
 						}
 					} else if((stdin_pollfd->revents & POLLHUP) != 0) {
+						close(stdin_pollfd->fd);
 						stdin_pollfd->fd = -1;
 					}
 
@@ -247,52 +252,66 @@ int main(
 								line_length
 							);
 						} else if(bytes_read == 0 || errno != EINTR) {
+							close(stdout_pollfd->fd);
 							stdout_pollfd->fd = -1;
 						}
 					} else if((stdout_pollfd->revents & POLLHUP) != 0) {
+						close(stdout_pollfd->fd);
 						stdout_pollfd->fd = -1;
 					}
 
 					if((stderr_pollfd->revents & POLLIN) != 0) {
-						char buffer[1024];
 						const ssize_t characters_read = read(
 							stderr_pollfd->fd,
-							buffer,
-							sizeof buffer
+							&stderr_buffer[stderr_size],
+							sizeof stderr_buffer - stderr_size
 						);
 						if(characters_read > 0) {
 							rl_save_prompt();
-							printf("\r\x1B[K");//rl_clear_visible_line();
+							rl_clear_visible_line();
 
-							char *line_end = buffer;
-							const char *line_start = line_end;
-							while(*line_end != '\0') {
-								while(true) {
-									if(*line_end == '\r') {
-										*line_end++ = '\0';
-										if(*line_end == '\n') {
-											++line_end;
-										}
-										break;
-									} else if(*line_end == '\n') {
-										*line_end++ = '\0';
-										break;
-									} else if(*line_end == '\0') {
-										break;
-									}
+							size_t line_start_offset = 0U;
+
+							const size_t new_stderr_size = stderr_size + characters_read;
+							while(stderr_size < new_stderr_size) {
+								if(stderr_buffer[stderr_size] == '\n') {
+									printf(
+										"\x1B[31m%.*s\x1B[0m\n",
+										(int)(stderr_size - line_start_offset),
+										&stderr_buffer[line_start_offset]
+									);
+									++stderr_size;
+									line_start_offset = stderr_size;
+								} else {
+									++stderr_size;
 								}
+							}
 
-								printf("%s\n", line_start);
-								line_start = line_end;
+							stderr_size -= line_start_offset;
+							memmove(
+								stderr_buffer,
+								&stderr_buffer[line_start_offset],
+								stderr_size
+							);
+
+							if(stderr_size >= sizeof stderr_buffer) {
+								stderr_size = snprintf(
+									stderr_buffer,
+									sizeof stderr_buffer,
+									"<...>"
+								);
+								stderr_size = 0U;
 							}
 
 							rl_on_new_line();
 							rl_restore_prompt();
 							rl_redisplay();
 						} else if(characters_read == 0 || errno != EINTR) {
+							close(stderr_pollfd->fd);
 							stderr_pollfd->fd = -1;
 						}
 					} else if((stderr_pollfd->revents & POLLHUP) != 0) {
+						close(stderr_pollfd->fd);
 						stderr_pollfd->fd = -1;
 					}
 				}

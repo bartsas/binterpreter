@@ -10,11 +10,11 @@
 #include <string.h>
 
 enum {
-	BLOCK_SIZE         = 1024,
-	NAME_CAPACITY      = 32,
-	MAX_ARGUMENT_COUNT = 8,
+	BLOCK_SIZE = 1024,
+	NAME_CAPACITY = 32,
 	FILE_PATH_CAPACITY = 1024,
-	COMMAND_CAPACITY   = 1024
+	COMMAND_CAPACITY = 1024,
+	ENVIRONMENT_VARIABLE_CAPACITY = 128
 };
 
 static bool parse_integer_or_expression(
@@ -40,19 +40,27 @@ static void skip_whitespace(
 	}
 }
 
-static bool consume_token(
-	const char **const current_char,
-	const char *const expected_token
+static bool append_format_va(
+	char error_message[],
+	size_t *const offset,
+	const char *const format,
+	va_list arguments
 ) {
-	const char *const start_char = *current_char;
-	for(const char *expected_char = expected_token; *expected_char != '\0'; ++expected_char) {
-		if(**current_char != *expected_char) {
-			*current_char = start_char;
-			return false;
-		}
-		++*current_char;
+	if(*offset >= ERROR_MESSAGE_CAPACITY) {
+		return false;
 	}
-	skip_whitespace(current_char);
+
+	const int result = vsnprintf(
+		error_message + *offset,
+		ERROR_MESSAGE_CAPACITY - *offset,
+		format,
+		arguments
+	);
+
+	if(result == EOF) {
+		return false;
+	}
+	*offset += result;
 	return true;
 }
 
@@ -62,31 +70,26 @@ static bool append_format(
 	const char *const format,
 	...
 ) {
-	if(*offset >= ERROR_MESSAGE_CAPACITY) {
-		return false;
-	}
+	bool result = false;
 
 	va_list arguments;
 	va_start(arguments, format);
-	const int result = vsnprintf(
-		error_message + *offset,
-		ERROR_MESSAGE_CAPACITY - *offset,
+	result = append_format_va(
+		error_message,
+		offset,
 		format,
 		arguments
 	);
 	va_end(arguments);
 
-	if(result == EOF) {
-		return false;
-	}
-	*offset += result;
-	return true;
+	return result;
 }
 
 static void generate_unexpected_char_message(
 	const char *const *const current_char,
 	char error_message[],
-	const char *const expected_char
+	const char *const expected_char,
+	...
 ) {
 	size_t offset = 0;
 	error_message[offset] = '\0';
@@ -127,7 +130,7 @@ static void generate_unexpected_char_message(
 			if(!append_format(
 				error_message,
 				&offset,
-				"\\x02X",
+				"\\x%02X",
 				(unsigned int)**current_char
 			)) {
 				return;
@@ -145,12 +148,58 @@ static void generate_unexpected_char_message(
 		if(!append_format(
 			error_message,
 			&offset,
-			", expecting %s",
-			expected_char
+			", expecting "
 		)) {
 			return;
 		}
+
+		va_list arguments;
+		va_start(arguments, expected_char);
+		append_format_va(
+			error_message,
+			&offset,
+			expected_char,
+			arguments
+		);
+		va_end(arguments);
 	}
+}
+
+static bool consume_token(
+	const char **const current_char,
+	const char *const expected_token
+) {
+	const char *const start_char = *current_char;
+	for(const char *expected_char = expected_token; *expected_char != '\0'; ++expected_char) {
+		if(**current_char != *expected_char) {
+			*current_char = start_char;
+			return false;
+		}
+		++*current_char;
+	}
+	skip_whitespace(current_char);
+	return true;
+}
+
+static bool expect_token(
+	const char **const current_char,
+	const char *const expected_token,
+	char error_message[]
+) {
+	for(const char *expected_char = expected_token; *expected_char != '\0'; ++expected_char) {
+		if(**current_char != *expected_char) {
+			generate_unexpected_char_message(
+				current_char,
+				error_message,
+				"character '%c'",
+				*expected_char
+			);
+			return false;
+		}
+		++*current_char;
+	}
+	skip_whitespace(current_char);
+	return true;
 }
 
 static bool parse_string_char(
@@ -397,6 +446,29 @@ static bool parse_arguments(
 					current_char,
 					string,
 					capacity,
+					error_message
+				);
+				break;
+			}
+			case 'b': {
+				uint8_t **const argument_buffer = va_arg(
+					arguments,
+					uint8_t **
+				);
+				size_t *const argument_size = va_arg(
+					arguments,
+					size_t *
+				);
+
+				*argument_buffer = NULL;
+				size_t argument_capacity = 0U;
+				*argument_size = 0U;
+
+				success = parse_bytes_concatenation(
+					current_char,
+					argument_buffer,
+					&argument_capacity,
+					argument_size,
 					error_message
 				);
 				break;
@@ -723,9 +795,10 @@ static bool parse_integer_primary(
 			current_char,
 			result,
 			error_message
-		) && consume_token(
+		) && expect_token(
 			current_char,
-			")"
+			")",
+			error_message
 		);
 	}
 
@@ -821,15 +894,39 @@ static bool parse_integer_primary(
 				}
 				++*current_char;
 			}
-
-			skip_whitespace(current_char);
-			return true;
-		}
-
-		*result = 0;
-		while('0' <= **current_char && **current_char <= '7') {
-			*result = *result * 010 + (**current_char - '0');
+		} else if(tolower(**current_char) == 'b') {
 			++*current_char;
+
+			/* Make sure there is at least one hexadecimal digit. */
+			if(**current_char != '0' && **current_char != '1') {
+				generate_unexpected_char_message(
+					current_char,
+					error_message,
+					"binary digit"
+				);
+				return false;
+			}
+
+			*result = 0;
+			while(true) {
+				if('0' == **current_char || **current_char == '1') {
+					*result = *result * 2 + (**current_char - '0');
+				} else {
+					break;
+				}
+				++*current_char;
+			}
+		} else {
+			/* Allow both 0 and 0o prefixes. */
+			if(tolower(**current_char) == 'o') {
+				++*current_char;
+			}
+
+			*result = 0;
+			while('0' <= **current_char && **current_char <= '7') {
+				*result = *result * 010 + (**current_char - '0');
+				++*current_char;
+			}
 		}
 
 		skip_whitespace(current_char);
@@ -841,6 +938,50 @@ static bool parse_integer_primary(
 		while(isdigit(**current_char)) {
 			*result = *result * 10 + (**current_char - '0');
 			++*current_char;
+		}
+
+		if(tolower(**current_char) == 'r') {
+			++*current_char;
+
+			const unsigned long base = *result;
+			if(base > 36ul) {
+				snprintf(
+					error_message,
+					ERROR_MESSAGE_CAPACITY,
+					"base cannot be higher than 36: %lu",
+					base
+				);
+				return false;
+			}
+
+			/* Make sure there is at least one digit. */
+			if(('0' > **current_char || **current_char >= '0' + base) && (base < 0xA || (('A' > **current_char || **current_char >= 'A' + base - 0xA) && ('a' > **current_char || **current_char >= 'a' + base - 0xA)))) {
+				generate_unexpected_char_message(
+					current_char,
+					error_message,
+					"base-%lu digit",
+					base
+				);
+				return false;
+			}
+
+			*result = 0;
+			while(true) {
+				if('0' <= **current_char && **current_char <= '9' && **current_char < '0' + base) {
+					*result = *result * base + (**current_char - '0');
+				} else if(base >= 0xA) {
+					if('A' <= **current_char && **current_char < 'A' + base - 0xAul) {
+						*result = *result * base + (**current_char - 'A' + 0xA);
+					} else if('a' <= **current_char && **current_char < 'a' + base - 0xAul) {
+						*result = *result * base + (**current_char - 'a' + 0xA);
+					} else {
+						break;
+					}
+				} else {
+					break;
+				}
+				++*current_char;
+			}
 		}
 
 		skip_whitespace(current_char);
@@ -1276,7 +1417,7 @@ static bool append_be_integer(
 			result_capacity,
 			result_size,
 			error_message,
-			integer_value >> integer_size - bit_offset - 8 & 0xFF
+			(integer_value >> (integer_size - bit_offset - 8)) & 0xFF
 		)) {
 			return false;
 		}
@@ -1317,7 +1458,39 @@ static bool append_le_integer(
 			result_capacity,
 			result_size,
 			error_message,
-			integer_value >> bit_offset & 0xFF
+			(integer_value >> bit_offset) & 0xFF
+		)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static bool load_environment_variable(
+	uint8_t **const result_buffer,
+	size_t *const result_capacity,
+	size_t *const result_size,
+	char error_message[],
+	const char *const name
+) {
+	const char *const value = getenv(name);
+	if(value == NULL) {
+		snprintf(
+			error_message,
+			ERROR_MESSAGE_CAPACITY,
+			"no such environment variable: %s",
+			name
+		);
+		return false;
+	}
+
+	for(const char *value_char = value; *value_char != '\0'; ++value_char) {
+		if(!append_byte(
+			result_buffer,
+			result_capacity,
+			result_size,
+			error_message,
+			*value_char
 		)) {
 			return false;
 		}
@@ -1373,6 +1546,39 @@ static bool load_data_from_file(
 	return success;
 }
 
+static bool parse_base64_digit(
+	const char **const current_char,
+	unsigned long *const value,
+	char error_message[]
+) {
+	*value <<= 6;
+
+	if('A' <= **current_char && **current_char <= 'Z') {
+		*value |= **current_char - 'A';
+	} else if('a' <= **current_char && **current_char <= 'z') {
+		*value |= **current_char - 'a' + 26;
+	} else if('0' <= **current_char && **current_char <= '9') {
+		*value |= **current_char - '0' + 52;
+	} else if(**current_char == '+' || **current_char == '-') {
+		*value |= 62;
+	} else if(**current_char == '/' || **current_char == ',' || **current_char == '_') {
+		*value |= 63;
+	} else {
+		snprintf(
+			error_message,
+			ERROR_MESSAGE_CAPACITY,
+			"invalid base64 digit: \\x%02X",
+			(unsigned int)**current_char
+		);
+		return false;
+	}
+
+	++*current_char;
+	skip_whitespace(current_char);
+
+	return true;
+}
+
 static bool parse_bytes_primary(
 	const char **const current_char,
 	uint8_t **const result_buffer,
@@ -1380,6 +1586,7 @@ static bool parse_bytes_primary(
 	size_t *const result_size,
 	char error_message[]
 ) {
+	/* Parenthised bytes */
 	if(consume_token(current_char, "{")) {
 		return parse_bytes_concatenation(
 			current_char,
@@ -1387,12 +1594,14 @@ static bool parse_bytes_primary(
 			result_capacity,
 			result_size,
 			error_message
-		) && consume_token(
+		) && expect_token(
 			current_char,
-			"}"
+			"}",
+			error_message
 		);
 	}
 
+	/* ASCII string */
 	if(**current_char == '\"') {
 		++*current_char;
 
@@ -1417,8 +1626,9 @@ static bool parse_bytes_primary(
 		return true;
 	}
 
-	if(consume_token(current_char, "`")) {
-		while(!consume_token(current_char, "`")) {
+	/* Hex string */
+	if(consume_token(current_char, "[")) {
+		while(!consume_token(current_char, "]")) {
 			uint8_t value = 0;
 			for(size_t digit_count = 0; digit_count < 2; ++digit_count) {
 				if('0' <= **current_char && **current_char <= '9') {
@@ -1451,6 +1661,117 @@ static bool parse_bytes_primary(
 		return true;
 	}
 
+	/* Base 64 string */
+	if(consume_token(current_char, "<")) {
+		while(true) {
+			/* At this point the length of the Base 64 string is a multiple of 4 so stop if
+			   the end of the string is reached. */
+			if(consume_token(current_char, ">")) {
+				return true;
+			}
+
+			unsigned long value = 0ul;
+
+			/* If the block did not end there must be at least 2 Base 64 digits in this
+			   block. */
+			if(!parse_base64_digit(
+				current_char,
+				&value,
+				error_message
+			) || !parse_base64_digit(
+				current_char,
+				&value,
+				error_message
+			)) {
+				return false;
+			}
+
+			/* A complete byte can already be extracted from the first 2 Base 64 digits. */
+			if(!append_byte(
+				result_buffer,
+				result_capacity,
+				result_size,
+				error_message,
+				(value >> 4) & 0xFFul /* 4 bits remain unused */
+			)) {
+				return false;
+			}
+
+			/* The string can end at this point. Both padded and unpadded strings are
+			   supported. */
+			if(consume_token(current_char, ">")) {
+				return true;
+			}
+			if(consume_token(current_char, "=")) {
+				/* In case of a padded string there must be 2 equal signs though. */
+				return expect_token(
+					current_char,
+					"=",
+					error_message
+				) && expect_token(
+					current_char,
+					">",
+					error_message
+				);
+			}
+
+			/* If the string did not end there must at least be 3 Base 64 digits. */
+			if(!parse_base64_digit(
+				current_char,
+				&value,
+				error_message
+			)) {
+				return false;
+			}
+
+			/* A second complete byte can now be extracted. */
+			if(!append_byte(
+				result_buffer,
+				result_capacity,
+				result_size,
+				error_message,
+				(value >> 2) & 0xFFul /* 2 bits remain unused */
+			)) {
+				return false;
+			}
+
+			/* The string can again end at this point. Both padded and unpadded strings are
+			   supported. */
+			if(consume_token(current_char, ">")) {
+				return true;
+			}
+			if(consume_token(current_char, "=")) {
+				return expect_token(
+					current_char,
+					">",
+					error_message
+				);
+			}
+
+			/* If the string did not end there are 3 bytes and possibly more blocks of 4
+			   Base 64 digits. */
+			if(!parse_base64_digit(
+				current_char,
+				&value,
+				error_message
+			)) {
+				return false;
+			}
+
+			/* Add the third and final character of this block. */
+			if(!append_byte(
+				result_buffer,
+				result_capacity,
+				result_size,
+				error_message,
+				value & 0xFFul /* no bits remain unused */
+			)) {
+				return false;
+			}
+		}
+	}
+
+	/* Function or named constant */
 	if(isalpha(**current_char)) {
 		char name[NAME_CAPACITY];
 		size_t name_size = 0;
@@ -1598,6 +1919,22 @@ static bool parse_bytes_primary(
 				argument
 			);
 		}
+		if(strcmp(name, "getenv") == 0) {
+			char environment_variable[ENVIRONMENT_VARIABLE_CAPACITY];
+			return parse_arguments(
+				current_char,
+				error_message,
+				"S",
+				environment_variable,
+				ENVIRONMENT_VARIABLE_CAPACITY
+			) && load_environment_variable(
+				result_buffer,
+				result_capacity,
+				result_size,
+				error_message,
+				environment_variable
+			);
+		}
 		if(strcmp(name, "read") == 0) {
 			char file_path[FILE_PATH_CAPACITY];
 			unsigned long size_limit = ~0ul;
@@ -1742,9 +2079,13 @@ static bool parse_bytes_concatenation(
 	size_t *const result_size,
 	char error_message[]
 ) {
+	/* Bytes can be concatenated by separating them by commas (,), semicolons (;) and
+	   just whitespace. */
 	while(consume_token(current_char, ",")
 		|| consume_token(current_char, ";")
-		|| (**current_char != '\0' && **current_char != '}' && **current_char != ')')
+		|| (**current_char != '\0'
+			&& **current_char != '}'
+			&& **current_char != ')')
 	) {
 		if(!parse_bytes_repetition(
 			current_char,
@@ -1767,7 +2108,11 @@ bool parse_byte_string(
 	size_t *const result_size,
 	char error_message[]
 ) {
+	/* All parse functions skip trailing whitespace so the next parse function can
+	   assume that the first useful character is at the start of the buffer it is
+	   passed. For this to work we have to skip the leading whitespace here. */
 	skip_whitespace(&input_string);
+
 	if(!parse_bytes_concatenation(
 		&input_string,
 		result_buffer,
@@ -1777,6 +2122,8 @@ bool parse_byte_string(
 	)) {
 		return false;
 	}
+
+	/* Make sure the full input has been consumed. */
 	if(*input_string != '\0') {
 		generate_unexpected_char_message(
 			&input_string,
@@ -1785,5 +2132,6 @@ bool parse_byte_string(
 		);
 		return false;
 	}
+
 	return true;
 }
